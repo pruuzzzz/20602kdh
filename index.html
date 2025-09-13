@@ -1,0 +1,518 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI 종이 던지기 게임</title>
+    <!-- onnxruntime-web CDN -->
+    <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"></script>
+    <style>
+        body {
+            margin: 0;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            background: linear-gradient(#0a0f1e, #1a1f36);
+            color: white;
+            font-family: 'Inter', sans-serif;
+            overflow: hidden;
+            text-align: center;
+        }
+        #gameCanvas {
+            border-radius: 12px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1), 0 1px 3px rgba(0, 0, 0, 0.08);
+            margin: 20px auto;
+        }
+        #gameUI {
+            position: absolute;
+            top: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            width: 90%;
+            max-width: 800px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 10px 20px;
+            border-radius: 8px;
+            background: rgba(0, 0, 0, 0.5);
+            backdrop-filter: blur(5px);
+            box-shadow: 0 0 10px rgba(0, 255, 221, 0.3);
+        }
+        #statusMessage {
+            font-size: 1.2rem;
+            color: #00ffdd;
+            font-weight: bold;
+        }
+        .ui-text {
+            font-size: 1rem;
+            font-weight: bold;
+        }
+        .glow {
+            animation: pulse-glow 2s infinite ease-in-out;
+        }
+        @keyframes pulse-glow {
+            0% { box-shadow: 0 0 5px rgba(0, 255, 221, 0.5); }
+            50% { box-shadow: 0 0 20px rgba(0, 255, 221, 0.8), 0 0 30px rgba(0, 255, 221, 0.5); }
+            100% { box-shadow: 0 0 5px rgba(0, 255, 221, 0.5); }
+        }
+        #loadingOverlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.7);
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            color: white;
+            font-size: 2rem;
+            text-shadow: 2px 2px 5px #00ffdd;
+            z-index: 100;
+        }
+        #loadingIndicator {
+            border: 5px solid #1a1f36;
+            border-top: 5px solid #00ffdd;
+            border-radius: 50%;
+            width: 50px;
+            height: 50px;
+            animation: spin 1s linear infinite;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        button {
+            padding: 10px 20px;
+            font-size: 1rem;
+            color: white;
+            background: linear-gradient(45deg, #00ffdd, #ff0055);
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.2);
+            transition: transform 0.2s, box-shadow 0.2s;
+            text-transform: uppercase;
+        }
+        button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 8px rgba(0, 0, 0, 0.3);
+        }
+        button:active {
+            transform: translateY(0);
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
+        }
+    </style>
+</head>
+<body>
+
+<div id="loadingOverlay">
+    <div id="loadingIndicator"></div>
+    <div style="margin-top: 20px;">AI 모델 로딩 중...</div>
+</div>
+
+<div id="gameUI">
+    <div class="ui-text">점수: <span id="score">0</span></div>
+    <div id="statusMessage" class="glow">AI 상태: 로딩 중...</div>
+    <div class="ui-text">남은 공: <span id="paperBallsLeft">10</span></div>
+</div>
+
+<canvas id="gameCanvas"></canvas>
+
+<script>
+    const canvas = document.getElementById('gameCanvas');
+    const ctx = canvas.getContext('2d');
+    const scoreEl = document.getElementById('score');
+    const statusEl = document.getElementById('statusMessage');
+    const paperBallsLeftEl = document.getElementById('paperBallsLeft');
+    const loadingOverlay = document.getElementById('loadingOverlay');
+
+    const WIDTH = 800;
+    const HEIGHT = 600;
+    const FPS = 60;
+    const TIME_PER_FRAME = 1000 / FPS;
+    
+    // PyGame 환경에서 가져온 색상 팔레트
+    const COLOR_PAPER = '#00ffdd';
+    const COLOR_TRASH_CAN = '#969696';
+    const COLOR_OBSTACLE = '#ff0055';
+    const COLOR_TEXT = '#ffffff';
+
+    // 물리학 상수
+    const GRAVITY = 49.0; // 중력을 98로 설정
+    const PAPER_MASS = 10;
+    const DAMPING = 0.99;
+    const WIND_MAX_STRENGTH = 5;
+    const MAX_VELOCITY = 50;
+    const MAX_ACCEL = 20; // 대략적인 최대 가속도 (바람+던지기 힘)
+    const GAME_TIME_MS = 120000; // 2분
+    
+    let session;
+    let modelReady = false;
+    let aiPlays = true;
+    let gameStartTime = Date.now();
+    let gameEndTime = gameStartTime + GAME_TIME_MS;
+    
+    // 게임 상태 변수
+    let score = 0;
+    let paperBallsLeft = 10; // 공 개수를 10개로 변경
+    let isThrown = false;
+    let isGameActive = false;
+    let windVector = { x: 0, y: 0 };
+
+    // 게임 오브젝트
+    const trash = {
+        pos: { x: WIDTH - 100, y: HEIGHT - 120 },
+        size: 80,
+        draw: function() {
+            ctx.fillStyle = COLOR_TRASH_CAN;
+            ctx.beginPath();
+            ctx.roundRect(this.pos.x - this.size / 2, this.pos.y - this.size, this.size, this.size, 10);
+            ctx.fill();
+            ctx.fillStyle = "#696969";
+            ctx.fillRect(this.pos.x - this.size / 2 - 10, this.pos.y - this.size - 10, this.size + 20, 10);
+        }
+    };
+
+    const obstacle = {
+        pos: { x: WIDTH * 0.4, y: HEIGHT * 0.7 },
+        vel: { x: 30, y: 0 },
+        size: { width: 30, height: 80 },
+        draw: function() {
+            ctx.fillStyle = COLOR_OBSTACLE;
+            ctx.beginPath();
+            ctx.roundRect(this.pos.x - this.size.width / 2, this.pos.y - this.size.height / 2, this.size.width, this.size.height, 5);
+            ctx.fill();
+        },
+        update: function(dt) {
+            this.pos.x += this.vel.x * dt;
+            // 벽 반사
+            if (this.pos.x + this.size.width / 2 > WIDTH * 0.6 || this.pos.x - this.size.width / 2 < WIDTH * 0.2) {
+                this.vel.x *= -1;
+            }
+        },
+        rect: function() {
+            return {
+                x: this.pos.x - this.size.width / 2,
+                y: this.pos.y - this.size.height / 2,
+                width: this.size.width,
+                height: this.size.height
+            };
+        }
+    };
+
+    const paperBall = {
+        pos: { x: 150, y: HEIGHT - 150 },
+        vel: { x: 0, y: 0 },
+        acc: { x: 0, y: 0 },
+        size: 15,
+        isThrown: false,
+        isLanded: false,
+        draw: function() {
+            ctx.save();
+            // 빛 효과
+            const gradient = ctx.createRadialGradient(this.pos.x, this.pos.y, 0, this.pos.x, this.pos.y, this.size * 2);
+            gradient.addColorStop(0, `rgba(0, 255, 221, 0.8)`);
+            gradient.addColorStop(1, `rgba(0, 255, 221, 0)`);
+            ctx.fillStyle = gradient;
+            ctx.beginPath();
+            ctx.arc(this.pos.x, this.pos.y, this.size * 2, 0, Math.PI * 2);
+            ctx.fill();
+            
+            ctx.fillStyle = COLOR_PAPER;
+            ctx.beginPath();
+            ctx.arc(this.pos.x, this.pos.y, this.size, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.restore();
+        },
+        update: function(dt) {
+            if (!this.isThrown || this.isLanded) {
+                return;
+            }
+
+            this.acc.y = GRAVITY / PAPER_MASS;
+            this.acc.x = windVector.x / PAPER_MASS;
+            this.acc.y += windVector.y / PAPER_MASS;
+
+            this.vel.x += this.acc.x * dt;
+            this.vel.y += this.acc.y * dt;
+
+            // 속도 감쇠
+            this.vel.x *= DAMPING;
+            this.vel.y *= DAMPING;
+
+            this.pos.x += this.vel.x;
+            this.pos.y += this.vel.y;
+
+            // 바닥 충돌
+            if (this.pos.y >= HEIGHT - this.size) {
+                this.pos.y = HEIGHT - this.size;
+                this.vel.x = 0;
+                this.vel.y = 0;
+                this.isLanded = true;
+            }
+        },
+        reset: function() {
+            this.pos = { x: 150, y: HEIGHT - 150 };
+            this.vel = { x: 0, y: 0 };
+            this.acc = { x: 0, y: 0 };
+            this.isThrown = false;
+            this.isLanded = false;
+        }
+    };
+
+    // ONNX 모델 로드
+    async function loadModel() {
+        loadingOverlay.style.display = 'flex';
+        statusEl.textContent = "AI 모델 로딩 중...";
+        try {
+            session = await ort.InferenceSession.create('./model.onnx');
+            modelReady = true;
+            loadingOverlay.style.display = 'none';
+            statusEl.textContent = "AI 상태: 준비 완료";
+            startGame();
+        } catch (e) {
+            console.error("모델 로드 실패:", e);
+            statusEl.textContent = "AI 상태: 모델 로드 실패";
+            loadingOverlay.style.display = 'none';
+        }
+    }
+
+    // 게임 관찰(Observation) 생성 및 정규화
+    function getObservation() {
+        // game_env.py의 관찰 공간 순서에 정확히 맞춰야 함
+        const obs = new Float32Array(12);
+        
+        // 정규화 함수
+        const normalize = (value, max_value) => value / max_value;
+
+        // 0. 공의 X 위치
+        obs[0] = normalize(paperBall.pos.x, WIDTH);
+        // 1. 공의 Y 위치
+        obs[1] = normalize(paperBall.pos.y, HEIGHT);
+        // 2. 공의 X 속도
+        obs[2] = normalize(paperBall.vel.x, MAX_VELOCITY);
+        // 3. 공의 Y 속도
+        obs[3] = normalize(paperBall.vel.y, MAX_VELOCITY);
+        // 4. 공의 X 가속도
+        obs[4] = normalize(paperBall.acc.x, MAX_ACCEL);
+        // 5. 공의 Y 가속도
+        obs[5] = normalize(paperBall.acc.y, MAX_ACCEL);
+        // 6. 휴지통의 X 위치
+        obs[6] = normalize(trash.pos.x, WIDTH);
+        // 7. 휴지통의 Y 위치
+        obs[7] = normalize(trash.pos.y, HEIGHT);
+        // 8. 장애물의 X 위치
+        obs[8] = normalize(obstacle.pos.x, WIDTH);
+        // 9. 장애물의 Y 위치
+        obs[9] = normalize(obstacle.pos.y, HEIGHT);
+        // 10. 바람 벡터의 X 성분
+        obs[10] = normalize(windVector.x, WIND_MAX_STRENGTH);
+        // 11. 바람 벡터의 Y 성분
+        obs[11] = normalize(windVector.y, WIND_MAX_STRENGTH);
+        
+        // AI 모델이 12개의 입력만 기대하므로 아래 두 값은 제거
+        // obs[12] = normalize(paperBallsLeft, 5);
+        // obs[13] = normalize(Math.max(0, gameEndTime - Date.now()), GAME_TIME_MS);
+
+        return obs;
+    }
+
+    // AI의 행동 실행
+    async function aiPlay() {
+        if (!modelReady || !isGameActive) return;
+
+        statusEl.textContent = "AI가 생각 중...";
+        const observation = getObservation();
+        const inputTensor = new ort.Tensor('float32', observation, [1, 12]);
+
+        try {
+            const results = await session.run({ observation: inputTensor });
+            const output = results.action.data;
+            
+            // 모델 출력에서 가장 높은 값의 인덱스(행동) 찾기
+            let action = 0;
+            let maxVal = -Infinity;
+            for (let i = 0; i < output.length; i++) {
+                if (output[i] > maxVal) {
+                    maxVal = output[i];
+                    action = i;
+                }
+            }
+
+            // 모델이 행동 0을 선택했을 경우, 무작위로 다른 행동을 강제 선택
+            if (action === 0) {
+                // 1부터 4까지의 행동 중 무작위 선택
+                action = Math.floor(Math.random() * 4) + 1;
+            }
+
+            statusEl.textContent = `AI가 행동 ${action}을 선택했습니다.`;
+            // 0: 아무것도 하지 않음
+            // 1: 약하게 위로 던지기 (force=5, angle=-60)
+            // 2: 약하게 아래로 던지기 (force=5, angle=-45)
+            // 3: 강하게 위로 던지기 (force=10, angle=-60)
+            // 4: 강하게 아래로 던지기 (force=10, angle=-45)
+            switch (action) {
+                case 1:
+                    throwBall(5, -60);
+                    break;
+                case 2:
+                    throwBall(5, -45);
+                    break;
+                case 3:
+                    throwBall(10, -60);
+                    break;
+                case 4:
+                    throwBall(10, -45);
+                    break;
+                default:
+                    // 이 코드는 이제 실행되지 않음
+                    setTimeout(aiPlay, 500);
+                    break;
+            }
+
+        } catch (e) {
+            console.error("AI 모델 실행 오류:", e);
+            statusEl.textContent = "AI 오류 발생";
+        }
+    }
+
+    function throwBall(force, angleDeg) {
+        if (paperBall.isThrown || !isGameActive) return;
+
+        const angleRad = angleDeg * (Math.PI / 180);
+        
+        paperBall.vel.x = force * Math.cos(angleRad);
+        paperBall.vel.y = force * Math.sin(angleRad);
+        paperBall.isThrown = true;
+    }
+
+    // 충돌 확인 및 점수 업데이트
+    function checkCollisions() {
+        // 휴지통에 들어갔는지 확인
+        const dist = Math.sqrt(
+            (paperBall.pos.x - trash.pos.x) ** 2 +
+            (paperBall.pos.y - trash.pos.y) ** 2
+        );
+        if (dist < trash.size / 2 && !paperBall.isLanded) {
+            score++;
+            scoreEl.textContent = score;
+            statusEl.textContent = "골인! 멋진데요!";
+            resetBall();
+            return;
+        }
+
+        // 장애물 충돌 확인
+        if (paperBall.pos.x > obstacle.rect().x &&
+            paperBall.pos.x < obstacle.rect().x + obstacle.rect().width &&
+            paperBall.pos.y > obstacle.rect().y &&
+            paperBall.pos.y < obstacle.rect().y + obstacle.rect().height) {
+            statusEl.textContent = "장애물에 부딪혔습니다!";
+            resetBall();
+            return;
+        }
+
+        // 화면 밖으로 나갔는지 확인
+        if (paperBall.pos.x < 0 || paperBall.pos.x > WIDTH || paperBall.pos.y < 0) {
+            statusEl.textContent = "공이 화면 밖으로 나갔습니다.";
+            resetBall();
+            return;
+        }
+
+        // 공이 바닥에 떨어졌는지 확인
+        if (paperBall.isLanded) {
+            statusEl.textContent = "아쉽게도 실패했습니다.";
+            resetBall();
+        }
+    }
+
+    // 공 리셋
+    function resetBall() {
+        if (!isGameActive) return;
+        paperBallsLeft--;
+        paperBallsLeftEl.textContent = paperBallsLeft;
+        paperBall.reset();
+        
+        if (paperBallsLeft <= 0) {
+            endGame();
+        } else {
+            setTimeout(aiPlay, 1000);
+        }
+    }
+
+    function startGame() {
+        isGameActive = true;
+        gameStartTime = Date.now();
+        gameEndTime = gameStartTime + GAME_TIME_MS;
+        score = 0;
+        paperBallsLeft = 10;
+        scoreEl.textContent = score;
+        paperBallsLeftEl.textContent = paperBallsLeft;
+        paperBall.reset();
+        windVector = { x: (Math.random() - 0.5) * WIND_MAX_STRENGTH, y: (Math.random() - 0.5) * WIND_MAX_STRENGTH };
+        loop();
+        aiPlay();
+    }
+
+    function endGame() {
+        isGameActive = false;
+        let finalMessage = `게임 종료! 최종 점수는 ${score}점 입니다.`;
+        if (score >= 5) {
+            finalMessage += " 완벽한 승리입니다!";
+        }
+        statusEl.textContent = finalMessage;
+        statusEl.classList.remove('glow');
+        
+        // 재시작 버튼 생성
+        const restartButton = document.createElement('button');
+        restartButton.textContent = '다시 시작';
+        restartButton.onclick = () => {
+            document.body.removeChild(restartButton);
+            statusEl.classList.add('glow');
+            startGame();
+        };
+        document.body.appendChild(restartButton);
+    }
+    
+    // 게임 루프
+    let lastTime = 0;
+    function loop(now) {
+        if (!isGameActive) return;
+        if (!lastTime) lastTime = now;
+        const dt = (now - lastTime) / 1000;
+        lastTime = now;
+        
+        // 캔버스 크기 조절
+        canvas.width = WIDTH;
+        canvas.height = HEIGHT;
+        
+        // 배경 그리기
+        const gradient = ctx.createLinearGradient(0, 0, 0, HEIGHT);
+        gradient.addColorStop(0, '#0a0f1e');
+        gradient.addColorStop(1, '#1a1f36');
+        ctx.fillStyle = gradient;
+        ctx.fillRect(0, 0, WIDTH, HEIGHT);
+        
+        // 오브젝트 업데이트 및 그리기
+        if (paperBall.isThrown) {
+             paperBall.update(dt);
+             checkCollisions();
+        }
+        obstacle.update(dt);
+        
+        trash.draw();
+        obstacle.draw();
+        paperBall.draw();
+        
+        requestAnimationFrame(loop);
+    }
+
+    window.onload = loadModel;
+</script>
+
+</body>
+</html>
